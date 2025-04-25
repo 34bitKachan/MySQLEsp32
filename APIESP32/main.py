@@ -1,99 +1,90 @@
-import time
 from flask import Flask
-from flask_sock import Sock
+import time, threading
+from flask import request, jsonify
 import mysql.connector
 from mysql.connector import Error
-import json
-from functools import wraps
-
 app = Flask(__name__)
-sock = Sock(app)
 
+# Переменные для контроля времени последнего запроса
+last_request_time = None
+timer_active = True
+time_sleep = 60 # если не было запросов через 60 секунд, значит esp32 спит
+# Конфигурация базы данных
 db_config = {
-    'host': '127.127.126.50',
-    'user': 'esp32',
-    'password': '1234',
+    'host': '127.127.126.25',
+    'user': 'root',
+    'password': '',
     'database': 'ESP32'
 }
+def check_requests_timeout():
+    global last_request_time, timer_active
+    while timer_active:
+        if last_request_time is not None and (time.time() - last_request_time) > time_sleep:  # 60 секунд = 1 минута
+            print("⚠️ Не было запросов к /api в течение 1 минуты!")
+            last_request_time = None  # Сброс, чтобы не спамить в консоль
+            try:
+                # Подключаемся к MySQL
+                connection = mysql.connector.connect(**db_config)
+                cursor = connection.cursor()
 
+                # Выполняем SQL запрос
+                query = "INSERT INTO data (status) VALUES (%s)"
+                cursor.execute(query, (0))
+                connection.commit()
 
-def handle_websocket_close(func):
-    @wraps(func)
-    def wrapper(ws):
-        client_ip = ws.environ.get('REMOTE_ADDR', 'unknown')
-        print(f"New connection from {client_ip}")
+                return jsonify({'status': 'success'})
 
-        try:
-            return func(ws)
-        except (ConnectionError, BrokenPipeError, OSError) as e:
-            print(f"WebSocket connection lost with {client_ip}: {e}")
-            on_websocket_close(ws, client_ip)
-        except Exception as e:
-            print(f"Unexpected error with {client_ip}: {e}")
-            on_websocket_close(ws, client_ip)
-        finally:
-            on_websocket_close(ws, client_ip)
+            except Error as e:
+                return jsonify({'status': 'error', 'message': str(e)}), 500
 
-    return wrapper
+            finally:
+                if 'connection' in locals() and connection.is_connected():
+                    cursor.close()
+                    connection.close()
+        time.sleep(1)  # Проверяем каждую секунду
 
+# Запускаем фоновый поток для проверки таймаута
+thread = threading.Thread(target=check_requests_timeout)
+thread.daemon = True
+thread.start()
 
-def on_websocket_close(ws, client_ip="unknown"):
-    print(f"Connection with {client_ip} closed")
-    # Здесь можно добавить очистку ресурсов
-
-def write_to_db(data):
+@app.route('/api', methods=['POST'])
+def api():
+    global last_request_time
+    last_request_time = time.time()  # Обновляем время последнего запроса
     try:
+        # Получаем JSON данные из запроса
+        data = request.get_json()
+
+        # Проверяем обязательные поля
+        if not data or 'status' not in data or 'level_garbage' not in data or 'level_energy' not in data:
+            return jsonify({'status': 'error', 'message': 'Missing required fields'}), 400
+
+        # Подключаемся к MySQL
         connection = mysql.connector.connect(**db_config)
         cursor = connection.cursor()
-
-        query = """INSERT INTO indication 
-                   (status, level_garbage, level_energy) 
-                   VALUES (%s, %s, %s)"""
-        cursor.execute(query, (data['status'], data['level_garbage'], data['level_energy']))
+        if data["clear"] is True:
+            query = "INSERT INTO data (status, level_garbage, level_energy) VALUES (%s, %s, %s)"
+            cursor.execute(query, (data['status'], data['level_garbage'], data['level_energy']))
+        # Выполняем SQL запрос
+        else:
+            query = "INSERT INTO data (status, level_garbage, level_energy) VALUES (%s, %s, %s)"
+            cursor.execute(query, (data['status'], data['level_garbage'], data['level_energy']))
         connection.commit()
 
-        print(f"Data inserted: {data}")
+        return jsonify({'status': 'success'})
 
     except Error as e:
-        print(f"Database error: {e}")
-        # При ошибке записи в БД отправляем статус 0
-        error_data = {'status': 0, 'level_garbage': 0, 'level_energy': 0}
-        write_to_db(error_data)
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
     finally:
-        if connection.is_connected():
+        if 'connection' in locals() and connection.is_connected():
             cursor.close()
             connection.close()
 
-@sock.route('/websocket')
-@handle_websocket_close
-def websocket(ws):
-
-    while True:
-        last_active = time.time()
-        message = ws.receive(timeout=5)  # Ожидание сообщения от ESP32
-
-        print("Received: ", message)
-        try:
-            message = ws.receive()  # Таймаут 5 секунд
-            message = json.loads(message)
-            # Проверяем наличие всех полей
-            if all(key in message for key in ['status', 'level_garbage', 'level_energy']):
-                write_to_db(message)
-                response = "Database INSERT"  # Формирование ответа
-                ws.send(response)  # Отправка ответа обратно на ESP32
-            else:
-                print("Invalid data format")
-                ws.send("Invalid data format")  # Отправка ответа обратно на ESP32
-
-        except Exception as e:
-            print(f"Error processing data: {e}")
-            ws.send(f"Error processing data: {e}")  # Отправка ответа обратно на ESP32
-        except TimeoutError:
-            # Проверяем, когда последний раз было активность
-            if time.time() - last_active > 30:  # 30 секунд без активности
-                raise ConnectionError("Client timeout")
-            continue
-
-
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    try:
+        app.run(debug=True)
+    except KeyboardInterrupt:
+        timer_active = False  # Останавливаем поток при завершении программы
+        thread.join()
